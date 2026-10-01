@@ -1,0 +1,38 @@
+# Credentials and local settings
+.env
+.env.*
+!.env.example
+client_secret*.json
+*credentials*.json
+*token*.json
+*.pem
+*.key
+tokens/
+
+# Python environments and caches
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Generated media, diagnostics, and local data
+vids/
+clips/
+finished/
+cache/
+database/
+editF_output/
+*.log
+
+# Local media assets and old copies
+assets/
+clipSongs/
+clipEffect/
+clipIntro/
+[vV]ault/
+\[vault\]/
+
+.runtime/
+theFarm 3/VideoHighlighter/
