@@ -5,6 +5,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
+
+
+# ============================================================
+# FOLDER PATHS
+# ============================================================
+
+
+
+
 PROJECT_DIR = Path(__file__).resolve().parent
 
 MEDIA_FOLDER = PROJECT_DIR / "media"
@@ -15,17 +24,24 @@ CLIPS_FOLDER = MEDIA_FOLDER / "clips"
 DATABASE_FOLDER = PROJECT_DIR / "data"
 CACHE_FOLDER = PROJECT_DIR / "cache"
 
-#-------------------------------------#
+
+
+
+# ============================================================
+# FINDER SETTINGS
+# ============================================================
+
+
+
+
+
 #. "YT" for YouTube "TTV" for Twitch .#
 PLATFORM = "TTV"
 
 # ------------ FOR YOUTUBE ------------ #
 MAX_RESULTS_PER_QUERY = 50
 
-DAYS_BACK = 14
-
-MIN_VIDEO_MINUTES = 15
-MAX_VIDEO_MINUTES = 120
+DAYS_BACK = 14 
 
 DOWNLOAD_HEIGHT = 1080
 

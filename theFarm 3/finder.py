@@ -4,8 +4,7 @@ from datetime import datetime, timezone
 import requests
 import re
 
-from datetime import datetime, timezone
-
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 
@@ -24,19 +23,17 @@ SPEED_CHANNEL_ID = "UCWsDFcIhY2DBi3GB5uykGXA"
 
 
 def search_videos():
-    """Find IShowSpeed's active livestreams published this month."""
+    """Find YouTube completed streams of any specific streamer with certain filters"""
 
     now = datetime.now(timezone.utc)
-    month_start = now.replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
-    )
+    start_date = now - timedelta(days=settings.DAYS_BACK)
 
     response = youtube.search().list(
         part="snippet",
         channelId=SPEED_CHANNEL_ID,
         type="video",
         eventType="completed",
-        publishedAfter=month_start.isoformat(),
+        publishedAfter=start_date.isoformat(),
         order="viewCount",
         regionCode="US",
         maxResults=25

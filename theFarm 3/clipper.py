@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 from faster_whisper import WhisperModel
 import config as settings
-from farm_console import section
+from console import section
 
 
 def clean_caption(text: str) -> str:
