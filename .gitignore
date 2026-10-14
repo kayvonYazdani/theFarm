@@ -36,3 +36,6 @@ clipIntro/
 
 .runtime/
 theFarm 3/VideoHighlighter/
+
+#csv's
+.csv

@@ -53,6 +53,42 @@ PICK_TWITCH = "RANDOM" #Pick streamer (all caps) or select RANDOM
 
 
 
+EDITOR_FPS = 30
+
+EDITOR_BACKGROUND_BLUR = 70
+
+EDITOR_FOREGROUND_ZOOM = 1.8
+EDITOR_BACKGROUND_ZOOM = 1.0
+
+# FILTER SETTINGS
+EDITOR_SATURATION = 1.50
+EDITOR_CONTRAST = 1.25
+EDITOR_BRIGHTNESS = 0.10
+
+# CAPTION SETTINGS
+EDITOR_WHISPER_MODEL = "large-v3"
+EDITOR_WHISPER_LANGUAGE = "en"
+
+EDITOR_WHISPERX_PYTHON = (
+    Path(__file__).resolve().parent.parent
+    / ".venv-whisperx313" / "bin" / "python"
+)
+
+EDITOR_FONT = "/System/Library/Fonts/Avenir Next.ttc"
+EDITOR_CAPTION_SIZE = 64
+EDITOR_CAPTION_Y = 0.78
+
+EDITOR_CAPTION_MAX_CHARS = 28
+EDITOR_CAPTION_MAX_WORDS = 6
+EDITOR_CAPTION_PAUSE = 0.40
+EDITOR_CAPTION_MAX_WIDTH = 0.85
+
+EDITOR_CAPTION_COLOR = "#FFFFFF"
+EDITOR_CAPTION_HIGHLIGHT = "#C391FF"
+EDITOR_CAPTION_OUTLINE = 5
+EDITOR_CAPTION_POP = 1.18
+
+
 # ============================================================
 #                        📊 LIST'S 📊
 # ============================================================
