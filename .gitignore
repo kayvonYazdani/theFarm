@@ -39,3 +39,11 @@ theFarm 3/VideoHighlighter/
 
 #csv's
 .csv
+
+#random codex ?
+
+.env
+.venv-brain/
+__pycache__/
+cache/ai_*.json
+

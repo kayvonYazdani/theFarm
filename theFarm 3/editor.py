@@ -1,8 +1,11 @@
 
 """The Farm 3: vertical formatting, synchronized zoom, color, and karaoke captions."""
 
+import array
 import json
+import sys
 import math
+import random
 import subprocess
 from pathlib import Path
 
@@ -10,14 +13,26 @@ import config as settings
 
 
 class ZoomEditor:
+    # Maximum animated zoom: 1.20 = up to 20% closer. Use 1.0 to disable zoom.
+    MAX_SCALE = 1.20
+
     def __init__(self):
         """Store nonoverlapping zoom animations shared by both video layers."""
+        self.max_scale = float(self.MAX_SCALE)
+        if not math.isfinite(self.max_scale) or not 1 <= self.max_scale <= 2:
+            raise ValueError("MAX_SCALE must be between 1.0 and 2.0")
         self.events = []
 
     def add_zoom(self, start, end, from_scale=1.0, to_scale=1.2):
-        """Add a smooth zoom transition that holds its ending scale."""
-        if start < 0 or end <= start or not (1 <= from_scale <= 2 and 1 <= to_scale <= 2):
-            raise ValueError("Invalid zoom times or scales (allowed: 1.0–2.0).")
+        """Add a smooth zoom, capping AI-requested scales at the configured limit."""
+        start, end = float(start), float(end)
+        from_scale, to_scale = float(from_scale), float(to_scale)
+        if (not all(math.isfinite(value) for value in (start, end, from_scale, to_scale))
+                or start < 0 or end <= start or from_scale < 1 or to_scale < 1):
+            raise ValueError("Zoom times must be finite and ordered; scales must be >= 1.0")
+        # Clamp both endpoints so consecutive AI zooms still join smoothly.
+        from_scale = min(from_scale, self.max_scale)
+        to_scale = min(to_scale, self.max_scale)
         if self.events:
             previous = self.events[-1]
             if start < previous["end"]:
@@ -37,13 +52,293 @@ class ZoomEditor:
                         f"({event['end']}-{event['start']}),0,1)")
             eased = f"(3*pow({progress},2)-2*pow({progress},3))"
             expression += f"+({event['to_scale'] - event['from_scale']})*{eased}"
-        return expression
+        # Enforce the limit in the actual render as well as when scheduling.
+        return f"clip({expression},1.0,{self.max_scale})"
 
     def build_filter(self, width, height):
         """Zoom the image while keeping its output rectangle unchanged."""
         return (f"zoompan=z='{self.build_expression()}':"
                 f"x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':"
                 f"d=1:s={width}x{height}:fps={settings.EDITOR_FPS}")
+
+
+class EffectsEditor:
+    """Schedule flashes and trigger shake from the clip audio level."""
+
+    FLASH_SECONDS = 0.65
+    FLASH_VOLUME = 0.65
+    VINE_BOOM_VOLUME = 0.65  # Volume multiplier for random clip effects.
+
+    def __init__(self):
+        self.music = None
+        self.songs_path = Path(__file__).resolve().parent / "editingMedia" / "clipSongs"
+        self.flash_times = []
+        self.vine_boom_events = []
+        self.clip_effects_path = (
+            Path(__file__).resolve().parent / "editingMedia" / "clipEffect"
+        )
+        self.shake_enabled = bool(getattr(settings, "EDITOR_SHAKE_ENABLED", True))
+        self.sound_path = (
+            Path(__file__).resolve().parent
+            / "editingMedia" / "assets" / "flashbang.mp3"
+        )
+
+    def flashbang(self, time):
+        """Trigger a fixed white flash + flashbang.mp3 at a video timestamp."""
+        time = float(time)
+        if not math.isfinite(time) or time < 0:
+            raise ValueError("Flashbang timestamp must be finite and nonnegative")
+        # Avoid duplicate sounds/flashes from repeated AI decisions.
+        if not any(abs(existing - time) < 0.001 for existing in self.flash_times):
+            self.flash_times.append(time)
+            self.flash_times.sort()
+
+    def vine_boom(self, time):
+        """Choose a random clipEffect sound once and schedule it at time (seconds)."""
+        time = float(time)
+        if not math.isfinite(time) or time < 0:
+            raise ValueError("Vine boom timestamp must be finite and nonnegative")
+        # Repeated AI decisions at the same timestamp keep the original selection.
+        for event in self.vine_boom_events:
+            if abs(event["time"] - time) < 0.001:
+                return event["path"]
+        if not self.clip_effects_path.is_dir():
+            raise FileNotFoundError(f"Clip effects folder not found: {self.clip_effects_path}")
+        extensions = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".aiff", ".aif", ".opus"}
+        sounds = sorted(path for path in self.clip_effects_path.iterdir()
+                        if path.is_file() and path.suffix.lower() in extensions)
+        if not sounds:
+            raise FileNotFoundError(f"No supported sound files in: {self.clip_effects_path}")
+        sound = random.choice(sounds)
+        self.vine_boom_events.append({"time": time, "path": sound})
+        self.vine_boom_events.sort(key=lambda event: event["time"])
+        return sound
+
+    # Background music volume multiplier; lower values keep speech clearer.
+    MUSIC_VOLUME = 0.12
+
+    def background_music(self, mood):
+        """Choose one random song for the whole clip: chill/upbeat, sad, or mystery."""
+        mood = str(mood).strip().lower()
+        aliases = {"chill": "chill/upbeat", "upbeat": "chill/upbeat",
+                   "chill/upbeat": "chill/upbeat", "sad": "sad", "mystery": "mystery"}
+        if mood not in aliases:
+            raise ValueError("Music mood must be 'chill/upbeat', 'sad', or 'mystery'")
+        mood = aliases[mood]
+        if self.music is not None and self.music["mood"] == mood:
+            return self.music["path"]
+        folders = {"chill/upbeat": "chill : uplift", "sad": "sad", "mystery": "mystery"}
+        folder = self.songs_path / folders[mood]
+        if not folder.is_dir():
+            raise FileNotFoundError(f"Music folder not found: {folder}")
+        extensions = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".aiff", ".aif", ".opus"}
+        songs = sorted(path for path in folder.iterdir()
+                       if path.is_file() and path.suffix.lower() in extensions)
+        if not songs:
+            raise FileNotFoundError(f"No supported songs in: {folder}")
+        song = random.choice(songs)
+        self.music = {"mood": mood, "path": song}
+        return song
+
+    # Shake controls: digital RMS dBFS (0 = maximum; more negative = more sensitive).
+    SHAKE_THRESHOLD_DB = -5.0
+    SHAKE_PIXELS = 5
+    SHAKE_SPEED = 2.0
+
+    def shake(self):
+        """Enable shake only while the clip audio meets SHAKE_THRESHOLD_DB."""
+        self.shake_enabled = True
+
+    def _audio_shake_events(self, input_video):
+        """Measure stereo RMS every 20 ms; no fixed duration or release tail."""
+        threshold = float(getattr(settings, "EDITOR_SHAKE_THRESHOLD_DB", self.SHAKE_THRESHOLD_DB))
+        if not math.isfinite(threshold) or threshold > 0:
+            raise ValueError("Shake threshold must be finite and <= 0 dBFS")
+        # Analyze the clip before flash sound effects are mixed into it.
+        result = subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(input_video), "-vn", "-ac", "2", "-ar", "48000",
+            "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        samples = array.array("f")
+        samples.frombytes(result.stdout)
+        if sys.byteorder != "little":
+            samples.byteswap()
+        window = 960  # 20 ms at 48 kHz; visual changes occur on video frames.
+        limit = 10 ** (threshold / 20)
+        events = []
+        start = None
+        frames = len(samples) // 2
+        for offset in range(0, frames, window):
+            end = min(offset + window, frames)
+            # Either channel can trigger shake, without stereo phase cancellation.
+            rms = max(
+                math.sqrt(sum(value * value for value in
+                              samples[2 * offset + channel:2 * end:2]) / (end - offset))
+                for channel in (0, 1)
+            )
+            if rms >= limit and start is None:
+                start = offset / 48000
+            elif rms < limit and start is not None:
+                events.append((start, offset / 48000 - start))
+                start = None
+        if start is not None:
+            events.append((start, frames / 48000 - start))
+        return events
+
+    def render(self, input_video, output_video):
+        """Apply flashes and shakes after captions; let every effect sound finish."""
+        input_video = Path(input_video)
+        output_video = Path(output_video)
+        shake_events = self._audio_shake_events(input_video) if self.shake_enabled else []
+        if not self.flash_times and not self.vine_boom_events and not shake_events and self.music is None:
+            return input_video
+        if input_video.resolve() == output_video.resolve():
+            raise ValueError("Effect input and output must be different files")
+        if self.flash_times and not self.sound_path.is_file():
+            raise FileNotFoundError(f"Flashbang MP3 not found: {self.sound_path}")
+
+        # Full white immediately, followed by a smooth 0.65-second recovery.
+        # Escape commas used inside FFmpeg's blend expression.
+        pulses = [
+            f"gte(T,{t})*lt(T,{t + self.FLASH_SECONDS})*"
+            f"pow(1-(T-{t})/{self.FLASH_SECONDS},2)"
+            for t in self.flash_times
+        ]
+        opacity = "min(1\\," + "+".join(f"({p})" for p in pulses) + ")"
+
+        graph = []
+        video_label = "[0:v]"
+        if self.flash_times:
+            graph += [
+                "[0:v]format=gbrp,split=2[original][flash_base]",
+                "[original][flash_base]"
+                f"blend=all_expr='A+(255-A)*({opacity})',format=yuv420p[flashed]",
+            ]
+            video_label = "[flashed]"
+        if shake_events:
+            strength = float(getattr(settings, "EDITOR_SHAKE_PIXELS", self.SHAKE_PIXELS))
+            speed = float(getattr(settings, "EDITOR_SHAKE_SPEED", self.SHAKE_SPEED))
+            if not all(math.isfinite(v) and v >= 0 for v in (strength, speed)):
+                raise ValueError("Shake strength and speed must be finite and nonnegative")
+            margin = max(2, math.ceil(strength / 2) * 2)
+            active = "+".join(
+                f"gte(t,{start})*lt(t,{start + duration})"
+                for start, duration in shake_events
+            )
+            # Overscan hides exposed edges; the original frame stays intact outside events.
+            graph += [
+                f"{video_label}split=2[steady][shake_source]",
+                f"[shake_source]scale=iw+{2 * margin}:ih+{2 * margin},"
+                f"crop=iw-{2 * margin}:ih-{2 * margin}:"
+                f"x='{margin}+{strength}*sin(2*PI*{speed}*t)':"
+                f"y='{margin}+{strength}*sin(2*PI*{speed * 1.37}*t)'[shaking]",
+                f"[steady][shaking]overlay=0:0:enable='{active}'[shaken]",
+            ]
+            video_label = "[shaken]"
+        # Extend the final frame only if a delayed sound outlasts the input video.
+        # amix ends after the longest input, so the MP3 is never trimmed by the flash.
+        graph.append(f"{video_label}tpad=stop_mode=clone:stop=-1,format=yuv420p[v]")
+        graph.append(
+            "[0:a]aresample=48000,aformat=sample_fmts=fltp:"
+            "channel_layouts=stereo[dialogue]"
+        )
+        inputs = ["-i", str(input_video)]
+        audio_labels = ["[dialogue]"]
+        sounds = [(time, self.sound_path, self.FLASH_VOLUME) for time in self.flash_times]
+        sounds += [(event["time"], event["path"], self.VINE_BOOM_VOLUME)
+                   for event in self.vine_boom_events]
+        for index, (time, sound_path, volume) in enumerate(sounds, start=1):
+            if not sound_path.is_file():
+                raise FileNotFoundError(f"Effect sound not found: {sound_path}")
+            inputs += ["-i", str(sound_path)]
+            graph.append(
+                f"[{index}:a]aresample=48000,"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"volume={volume},"
+                f"adelay={round(time * 1000)}:all=1[sound{index}]"
+            )
+            audio_labels.append(f"[sound{index}]")
+        if self.music is not None:
+            music_path = self.music["path"]
+            if not music_path.is_file():
+                raise FileNotFoundError(f"Music file not found: {music_path}")
+            volume = float(self.MUSIC_VOLUME)
+            if not math.isfinite(volume) or volume < 0:
+                raise ValueError("MUSIC_VOLUME must be finite and nonnegative")
+            probe = subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=duration:format=duration", "-of", "json",
+                str(input_video),
+            ], capture_output=True, text=True, check=True)
+            info = json.loads(probe.stdout)
+            duration = info.get("streams", [{}])[0].get("duration")
+            if duration in (None, "N/A"):
+                duration = info["format"]["duration"]
+            duration = float(duration)
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("Cannot determine the clip duration for music")
+            index = len(sounds) + 1
+            # Loop short songs and trim long ones; music never extends the clip.
+            inputs += ["-stream_loop", "-1", "-i", str(music_path)]
+            graph.append(
+                f"[{index}:a]aresample=48000,"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"atrim=duration={duration},asetpts=PTS-STARTPTS,"
+                f"volume={volume}[music]"
+            )
+            audio_labels.append("[music]")
+        graph.append(
+            "".join(audio_labels)
+            + f"amix=inputs={len(audio_labels)}:duration=longest:normalize=0,"
+            "alimiter=limit=0.95[a]"
+        )
+        output_video.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            *inputs, "-filter_complex", ";".join(graph),
+            "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", "-shortest", str(output_video),
+        ], check=True)
+        return output_video
+
+
+def apply_edit_plan(editor, plan, *, selected_assets=None):
+    """Schedule validated decisions only. Shake remains controlled by configuration."""
+    from brain import EditPlan, editor_capabilities
+    plan = EditPlan.model_validate(plan.model_dump() if hasattr(plan, "model_dump") else plan,
+                                  context={"duration": editor.info["duration"],
+                                           "capabilities": editor_capabilities()})
+    if editor.zoom.events or editor.effects.flash_times or editor.effects.vine_boom_events:
+        raise ValueError("Apply an AI plan to a fresh VideoEditor to avoid duplicate edits")
+    saved = selected_assets if selected_assets is not None else {}
+    for event in plan.zooms:
+        editor.zoom.add_zoom(event.start, event.end, event.from_scale, event.to_scale)
+    for event in plan.effects:
+        if event.kind == "flashbang":
+            editor.effects.flashbang(event.time)
+        elif event.kind == "vine_boom":
+            key = f"vine_boom:{event.time}"
+            if key in saved:
+                path = Path(saved[key])
+                if not path.is_file() or path.parent.resolve() != editor.effects.clip_effects_path.resolve():
+                    raise FileNotFoundError("Saved clip-effect asset is missing or outside clipEffect")
+                editor.effects.vine_boom_events.append({"time": event.time, "path": path})
+            else:
+                saved[key] = str(editor.effects.vine_boom(event.time))
+    if plan.background_music:
+        if "music" in saved:
+            path = Path(saved["music"])
+            folders = {"chill/upbeat": "chill : uplift", "sad": "sad", "mystery": "mystery"}
+            expected = editor.effects.songs_path / folders[plan.background_music]
+            if not path.is_file() or path.parent.resolve() != expected.resolve():
+                raise FileNotFoundError("Saved music asset is missing or has the wrong category")
+            editor.effects.music = {"mood": plan.background_music, "path": path}
+        else:
+            saved["music"] = str(editor.effects.background_music(plan.background_music))
+    return saved
 
 
 class VerticalFormatter:
@@ -114,6 +409,7 @@ class VideoEditor:
         self.vertical = VerticalFormatter()
         self.zoom = ZoomEditor()
         self.filters = FilterEditor()
+        self.effects = EffectsEditor()
 
     def get_video_info(self):
         """Read video size, frame rate, and duration with FFprobe."""
@@ -134,7 +430,7 @@ class VideoEditor:
         graph = ";".join((self.vertical.build_filter(self.zoom, self.info),
                           self.filters.build_filter()))
         subprocess.run([
-            "ffmpeg", "-y", "-hide_banner", "-i", str(self.video_path),
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(self.video_path),
             "-filter_complex", graph, "-map", "[final]", "-map", "0:a?",
             "-c:v", "libx264", "-preset", "fast", "-crf", "20",
             "-r", str(settings.EDITOR_FPS), "-c:a", "aac", "-b:a", "192k",
@@ -151,9 +447,18 @@ class CaptionEditor:
         self.whisperx_python = Path(settings.EDITOR_WHISPERX_PYTHON)
         self.font_path = settings.EDITOR_FONT
         self.font_size = settings.EDITOR_CAPTION_SIZE
-        self.position = settings.EDITOR_CAPTION_Y
+        # Vertical caption center: 0.0 = top, 0.5 = middle, 1.0 = bottom.
+        self.position = float(settings.EDITOR_CAPTION_Y)
+        # Additional pixel spacing beyond the font's ordinary space character.
+        self.word_spacing = float(getattr(settings, "EDITOR_CAPTION_WORD_SPACING", 0))
+        if not 0 <= self.position <= 1:
+            raise ValueError("EDITOR_CAPTION_Y must be between 0.0 and 1.0")
+        if self.word_spacing < 0:
+            raise ValueError("EDITOR_CAPTION_WORD_SPACING must be >= 0")
         self.max_chars = settings.EDITOR_CAPTION_MAX_CHARS
-        self.max_words = settings.EDITOR_CAPTION_MAX_WORDS
+        self.max_words = int(settings.EDITOR_CAPTION_MAX_WORDS)
+        if self.max_words < 1:
+            raise ValueError("EDITOR_CAPTION_MAX_WORDS must be at least 1")
         self.pause = settings.EDITOR_CAPTION_PAUSE
         self.max_width = settings.EDITOR_CAPTION_MAX_WIDTH
         self.color = settings.EDITOR_CAPTION_COLOR
@@ -173,12 +478,12 @@ class CaptionEditor:
         return [{"start": float(s.start), "end": float(s.end), "text": s.text.strip()}
                 for s in segments if s.text.strip()]
 
-    def align_words(self, video_path, segments, cache):
+    def align_words(self, video_path, segments, cache, prefix=""):
         """Align spoken words using WhisperX installed in its separate Python venv."""
         if not self.whisperx_python.is_file():
             raise FileNotFoundError(f"WhisperX Python not found: {self.whisperx_python}")
-        transcript_file = cache / "transcript.json"
-        aligned_file = cache / "aligned_words.json"
+        transcript_file = cache / f"{prefix}transcript.json"
+        aligned_file = cache / f"{prefix}aligned_words.json"
         transcript_file.write_text(json.dumps(segments, indent=2), encoding="utf-8")
         worker = '''
 import json
@@ -210,11 +515,11 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
         ]
         return self.words
 
-    def prepare(self, video_path, cache):
+    def prepare(self, video_path, cache, prefix=""):
         """Reuse existing aligned-word JSON or generate it from the input video."""
         cache = Path(cache)
         cache.mkdir(parents=True, exist_ok=True)
-        aligned_file = cache / "aligned_words.json"
+        aligned_file = cache / f"{prefix}aligned_words.json"
         if aligned_file.is_file():
             print("Loading cached WhisperX alignment...")
             words = self._load_aligned(aligned_file)
@@ -227,7 +532,7 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
             print("No dialogue detected.")
             return []
         print("WhisperX: Aligning words...")
-        words = self.align_words(video_path, segments, cache)
+        words = self.align_words(video_path, segments, cache, prefix)
         print(f"Successfully aligned {len(words)} words.")
         return words
 
@@ -281,7 +586,7 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
             size = self.font_size
             while size >= 16:
                 font = ImageFont.truetype(str(self.font_path), size)
-                gap = max(0.0, draw.textlength(" ", font=font))
+                gap = max(0.0, draw.textlength(" ", font=font)) + self.word_spacing
                 widths = [draw.textlength(word["text"].upper(), font=font) for word in phrase]
                 total = sum(widths) + gap * max(0, len(phrase) - 1)
                 if total <= 1080 * self.max_width:
@@ -304,10 +609,8 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
     def build_emoji_events(self, layouts):
         """Trigger the old Farm's emoji pops on matching spoken words."""
         import re
-        mapping = getattr(settings, "EDITOR_EMOJI_WORDS", {
-            "bro": "💀", "crazy": "🤯", "insane": "🤯", "money": "💰",
-            "love": "❤️", "fire": "🔥", "laugh": "😂", "wow": "😮",
-            "mad": "😡", "sad": "😢", "goat": "🐐", "win": "🏆"})
+        # All trigger words are controlled from config.py. An empty dict disables triggers.
+        mapping = {str(word).lower(): emoji for word, emoji in settings.EDITOR_EMOJI_WORDS.items()}
         min_gap = float(getattr(settings, "EDITOR_EMOJI_GAP", 2.5))
         last = -min_gap
         events = []
@@ -393,9 +696,124 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
                       stroke_width=self.outline, stroke_fill="black")
         return frame
 
-    def render_captions(self, input_video, output_video, video_info, cache):
+    def title_opacity(self, current_time: float) -> float:
+        age = current_time - self.TITLE_DELAY
+        if age < 0:
+            return 0.0
+        if age < self.TITLE_FADE_SECONDS:
+            return self.smoothstep(age / self.TITLE_FADE_SECONDS)
+        age -= self.TITLE_FADE_SECONDS
+        if age < self.TITLE_HOLD_SECONDS:
+            return 1.0
+        return 1.0 - self.smoothstep(
+            (age - self.TITLE_HOLD_SECONDS) / self.TITLE_FADE_SECONDS
+        )
+
+    def draw_title_overlay(
+        self, frame, title, current_time: float
+    ) -> None:
+        """Stationary title drawn last, above video, camera frame, captions and emojis."""
+        from PIL import Image, ImageChops, ImageFilter
+        opacity = self.title_opacity(current_time)
+        if opacity <= 0:
+            return
+        pulse = 0.5 - 0.5 * math.cos(
+            2
+            * math.pi
+            * self.TITLE_GLOW_PULSE_HZ
+            * max(0.0, current_time - self.TITLE_DELAY)
+        )
+        strength = self.TITLE_GLOW_STRENGTH * pulse
+        rgb = title.convert("RGB")
+        purple = Image.new("RGB", title.size, (135, 65, 220))
+        layer = Image.blend(rgb, ImageChops.screen(rgb, purple), strength).convert(
+            "RGBA"
+        )
+        layer.putalpha(title.getchannel("A"))
+        padding = 24
+        halo = Image.new(
+            "RGBA",
+            (title.width + 2 * padding, title.height + 2 * padding),
+            (135, 65, 220, 0),
+        )
+        mask = Image.new("L", halo.size, 0)
+        mask.paste(title.getchannel("A"), (padding, padding))
+        mask = mask.filter(ImageFilter.GaussianBlur(10)).point(
+            lambda a: round(a * strength * opacity)
+        )
+        halo.putalpha(mask)
+        frame.alpha_composite(
+            halo,
+            (
+                (self.OUTPUT_WIDTH - title.width) // 2 - padding,
+                self.TITLE_VISIBLE_Y - padding,
+            ),
+        )
+        layer.putalpha(layer.getchannel("A").point(lambda a: round(a * opacity)))
+        frame.alpha_composite(
+            layer, ((self.OUTPUT_WIDTH - layer.width) // 2, self.TITLE_VISIBLE_Y)
+        )
+
+    def prepare_title(self, title, folder, video_info):
+        """Reuse Farm 2.2's branded video header; never modifies title.jpg."""
+        from PIL import Image, ImageDraw, ImageFont
+        self.TITLE_HEADER = Path(settings.TITLE_HEADER)
+        if not self.TITLE_HEADER.is_file():
+            raise FileNotFoundError(f"Legacy title header missing: {self.TITLE_HEADER}")
+        self.OUTPUT_WIDTH = 1080
+        self.TITLE_DELAY = min(max(0.0, settings.TITLE_DELAY), max(0.0, video_info["duration"] - 0.1))
+        available = min(settings.TITLE_MAX_SECONDS, video_info["duration"] - self.TITLE_DELAY)
+        if available <= 0 or settings.TITLE_FADE_SECONDS <= 0:
+            raise ValueError("Title duration and fade must be positive")
+        self.TITLE_FADE_SECONDS = min(settings.TITLE_FADE_SECONDS, available / 3)
+        self.TITLE_HOLD_SECONDS = available - 2 * self.TITLE_FADE_SECONDS
+        self.TITLE_GLOW_STRENGTH = settings.TITLE_GLOW_STRENGTH
+        self.TITLE_GLOW_PULSE_HZ = settings.TITLE_GLOW_PULSE_HZ
+        if not 0 <= self.TITLE_GLOW_STRENGTH <= 1 or self.TITLE_GLOW_PULSE_HZ < 0:
+            raise ValueError("Invalid title glow settings")
+        with Image.open(self.TITLE_HEADER) as source:
+            image = source.convert("RGBA")
+        header_height = round(image.height * 1080 / image.width)
+        if settings.TITLE_VISIBLE_Y is None:
+            scale = min(1080 / video_info["width"], 1920 / video_info["height"])
+            height = round(video_info["height"] * scale * settings.EDITOR_FOREGROUND_ZOOM / 2) * 2
+            video_top = max(0, (1920 - height) // 2)
+            self.TITLE_VISIBLE_Y = max(0, video_top - header_height)
+        else:
+            self.TITLE_VISIBLE_Y = int(settings.TITLE_VISIBLE_Y)
+        draw = ImageDraw.Draw(image)
+        font_path = next((str(p) for p in settings.TITLE_FONT_PATHS if Path(p).is_file()), None)
+        if font_path is None:
+            raise FileNotFoundError("Legacy title font unavailable; set TITLE_FONT_PATHS")
+        text = " ".join(str(title).split())
+        if not text:
+            raise ValueError("Title cannot be empty")
+        max_width = image.width - settings.TITLE_TEXT_LEFT - settings.TITLE_TEXT_RIGHT
+        for size in range(settings.TITLE_FONT_SIZE, settings.TITLE_MIN_FONT_SIZE - 1, -1):
+            font = ImageFont.truetype(font_path, size)
+            if draw.textlength(text, font=font) <= max_width:
+                break
+        # Preserve the legacy single-line treatment without clipping longer AI titles.
+        if draw.textlength(text, font=font) > max_width:
+            while text and draw.textlength(text + "…", font=font) > max_width:
+                text = text[:-1]
+            text = text.rstrip() + "…"
+        draw.text((settings.TITLE_TEXT_LEFT, settings.TITLE_TEXT_Y), text, font=font, fill=settings.TITLE_TEXT_COLOR)
+        output = Path(folder) / "title_header.png"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        image.save(output)
+        return output
+
+
+    def render_captions(self, input_video, output_video, video_info, cache, title_path=None):
         """Stream Pillow captions and emojis directly to FFmpeg, avoiding huge PNG caches."""
         from PIL import ImageFont
+        title_image = None
+        if title_path is not None:
+            from PIL import Image
+            with Image.open(title_path) as source:
+                title_image = source.convert("RGBA")
+            title_image = title_image.resize((1080, round(title_image.height * 1080 / title_image.width)), Image.Resampling.LANCZOS)
         layouts = self.build_phrase_layouts()
         emojis = self.build_emoji_events(layouts) if getattr(settings, "EDITOR_EMOJIS", True) else []
         sprites = {event["emoji"]: self.emoji_sprite(event["emoji"]) for event in emojis}
@@ -431,6 +849,8 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
                        layouts[index]["start"] <= seconds < layouts[index]["end"]) else None
                 frame = self.render_caption_frame(seconds, layout, font_cache)
                 self.draw_emoji_effects(frame, seconds, emojis, sprites)
+                if title_image is not None:
+                    self.draw_title_overlay(frame, title_image, seconds)
                 process.stdin.write(frame.tobytes())
                 if frame_index % max(1, int(settings.EDITOR_FPS * 5)) == 0:
                     print(f"Captions: {seconds:.1f}s / {video_info['duration']:.1f}s", flush=True)
@@ -446,21 +866,27 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
         return output_video
 
 def main():
-    """Render the test video and add karaoke captions using saved alignment."""
+    """Render the test video with captions and a flashbang at 15 seconds."""
     desktop = Path.home() / "Desktop"
     source = desktop / "testTogi.mp4"
     cache = Path(__file__).resolve().parent / "cache" / "caption_test"
 
     editor = VideoEditor(source)
-    # Add smooth zooms here later, for example:
-    # editor.zoom.add_zoom(0.0, 0.5, from_scale=1.4, to_scale=1.0)
-    # editor.zoom.add_zoom(5.0, 6.0, from_scale=1.0, to_scale=1.3)
-    base_video = editor.render(desktop / "testTogi_edited.mp4")
+    editor.effects.flashbang(15.0)
+    # editor.effects.background_music("chill/upbeat")  # Or "sad" / "mystery".
+    editor.effects.vine_boom(8.0)  # Random clipEffect sound at 8 seconds.
+    editor.effects.shake()  # Shake only while the clip audio reaches the threshold.
+
+    cache.mkdir(parents=True, exist_ok=True)
+    base_video = editor.render(cache / "testTogi_edited.mp4")
 
     captions = CaptionEditor()
     captions.prepare(source, cache)
-    result = captions.render_captions(
-        base_video, desktop / "testTogi_captioned.mp4", editor.info, cache
+    captioned_video = captions.render_captions(
+        base_video, cache / "testTogi_captioned_base.mp4", editor.info, cache
+    )
+    result = editor.effects.render(
+        captioned_video, desktop / "testTogi_captioned.mp4"
     )
     print(f"Finished: {result}")
 

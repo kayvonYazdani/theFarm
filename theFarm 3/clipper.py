@@ -1,7 +1,7 @@
 """Transcribe, score and select raw clips."""
 
 from __future__ import annotations
-import math, re, wave
+import math, re, wave, shutil, subprocess
 from pathlib import Path
 from typing import Any
 import numpy as np
@@ -50,7 +50,7 @@ def uppercase_ratio(text: str) -> float:
 
 def get_duration(input_file: Path) -> float:
     """Read media duration in seconds using ffprobe."""
-    result = settings.run_command(
+    result = subprocess.run(
         [
             "ffprobe",
             "-v",
@@ -61,7 +61,7 @@ def get_duration(input_file: Path) -> float:
             "default=noprint_wrappers=1:nokey=1",
             str(input_file),
         ],
-        capture_output=True,
+        capture_output=True, text=True, check=True,
     )
     return float(result.stdout.strip())
 
@@ -72,7 +72,7 @@ def extract_audio_once(input_file: Path, run_id: str) -> Path:
         settings.CACHE_FOLDER
         / f"{input_file.stem}_{run_id}_{settings.SAMPLE_RATE}hz.wav"
     )
-    settings.run_command(
+    subprocess.run(
         [
             "ffmpeg",
             "-y",
@@ -377,7 +377,7 @@ def build_reason_label(clip: dict[str, Any]) -> str:
 
 def cut_clip(input_file: Path, start: float, end: float, output_file: Path) -> None:
     """Export a selected source interval with FFmpeg."""
-    settings.run_command(
+    subprocess.run(
         [
             "ffmpeg",
             "-y",
@@ -397,11 +397,11 @@ def cut_clip(input_file: Path, start: float, end: float, output_file: Path) -> N
             "-c:a",
             "aac",
             str(output_file),
-        ]
+        ], check=True
     )
 
 
-def run_clipper(video_file: Path, run_id: str) -> list[dict[str, Any]]:
+def run_legacy_clipper(video_file: Path, run_id: str) -> list[dict[str, Any]]:
     """Analyze a source, rank candidate intervals and export selected raw clips."""
     section("2 · Find clips")
     duration = get_duration(video_file)
@@ -535,3 +535,52 @@ def run_clipper(video_file: Path, run_id: str) -> list[dict[str, Any]]:
         clip["caption_short"] = short_caption(clip["caption_full"])
         exported.append(clip)
     return exported
+
+
+def run_clipper(video_file, run_id):
+    """Use the already-integrated VideoHighlighter backend without retuning detection."""
+    import hashlib
+    import importlib.util
+    import json
+    import os
+    import subprocess
+    source = Path(video_file).resolve()
+    worker = settings.LEGACY_FARM_DIR / "highlighter_worker.py"
+    selector = settings.LEGACY_FARM_DIR / "highlight_selection.py"
+    for path in (settings.VIDEOHIGHLIGHTER_PYTHON, settings.VIDEOHIGHLIGHTER_DIR / "pipeline.py", worker, selector):
+        if not path.is_file():
+            raise FileNotFoundError(f"Existing VideoHighlighter dependency missing: {path}")
+    # Reuse the exact legacy validation policy rather than duplicating it.
+    spec = importlib.util.spec_from_file_location("farm_highlight_policy", selector)
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    duration = get_duration(source)
+    config = dict(settings.VIDEOHIGHLIGHTER_OPTIONS)
+    config.update(clip_time=0, auto_max_clip=settings.MAX_CLIP_DURATION, exact_duration=None,
+                  farm_max_candidates=settings.VIDEOHIGHLIGHTER_MAX_CANDIDATES,
+                  farm_min_score=settings.VIDEOHIGHLIGHTER_MIN_SCORE,
+                  farm_min_prominence=settings.VIDEOHIGHLIGHTER_MIN_PROMINENCE,
+                  cache_dir=str(settings.CACHE_FOLDER), output_file=str(settings.CACHE_FOLDER / f"{run_id}_highlight.mp4"))
+    identity = hashlib.sha256(json.dumps(config, sort_keys=True).encode() + worker.read_bytes() + selector.read_bytes()).hexdigest()[:12]
+    output = settings.CACHE_FOLDER / f"{run_id}_{identity}_segments.json"
+    options = settings.CACHE_FOLDER / f"{run_id}_{identity}_options.json"
+    settings.CACHE_FOLDER.mkdir(parents=True, exist_ok=True)
+    if not output.is_file():
+        options.write_text(json.dumps(config))
+        env = os.environ.copy()
+        env["PATH"] = str(Path(shutil.which("ffmpeg")).parent) + os.pathsep + env.get("PATH", "")
+        subprocess.run([str(settings.VIDEOHIGHLIGHTER_PYTHON), str(worker), str(settings.VIDEOHIGHLIGHTER_DIR),
+                        str(source), str(output), str(options)], cwd=settings.VIDEOHIGHLIGHTER_DIR,
+                       timeout=settings.VIDEOHIGHLIGHTER_TIMEOUT, check=True, env=env)
+    segments = policy.validate_segments(json.loads(output.read_text()), duration,
+                                       settings.VIDEOHIGHLIGHTER_MAX_CANDIDATES, settings.MAX_CLIP_DURATION)
+    settings.CLIPS_FOLDER.mkdir(parents=True, exist_ok=True)
+    result = []
+    for index, (start, end) in enumerate(segments, 1):
+        target = settings.CLIPS_FOLDER / f"{run_id}_{identity}_{index:02d}.mp4"
+        if not target.is_file():
+            temporary = target.with_suffix(".partial.mp4")
+            cut_clip(source, start, end, temporary)
+            temporary.replace(target)
+        result.append({"raw_clip_file": target, "start": start, "end": end})
+    return result
