@@ -12,3 +12,5 @@ Shared environments, credentials, model installations and media remain local and
 are excluded by the root `.gitignore`. Review production upload and cleanup
 settings before running. No application license has been selected yet; third-party
 licenses and media rights still apply.
+
+Third-party dependency: The Farm integrates with VideoHighlighter, a separately installed project licensed under AGPL-3.0. VideoHighlighter is not distributed with this repository and remains subject to its own license.
