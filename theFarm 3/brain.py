@@ -1,15 +1,9 @@
-"""The Farm 3 AI director: all four stages, schemas, prompts and Gemini behavior.
-
-Setup: python -m pip install google-genai 'pydantic>=2,<3' python-dotenv
-Run: python brain.py VIDEO --transcript WORDS.json --debug
-Use editor's test video: python brain.py --test-togi --debug
-Only judge: add --judge-only. Rerun just publishing: --stage publishing --force.
-All outputs use existing config.CACHE_FOLDER; no rendering is performed.
-"""
+"""The Farm AI director. All four validated stages are orchestrated by run.py."""
 from __future__ import annotations
-import argparse
 import ast
 import hashlib
+from functools import lru_cache
+import tempfile
 import json
 import math
 import mimetypes
@@ -94,7 +88,7 @@ class TranscriptWord(StrictModel):
     def valid_range(self, info: ValidationInfo):
         if self.end <= self.start:
             raise ValueError('Word end must follow its start')
-        if info.context and self.end > info.context['duration'] + 0.05:
+        if info.context and self.end > info.context['duration']:
             raise ValueError('Transcript is not relative to this candidate clip')
         return self
 
@@ -264,6 +258,34 @@ class BrainError(RuntimeError):
     """Safe user-facing error: never contains provider text or credentials."""
 
 
+class InvalidAIResponse(BrainError):
+    """Bounded JSON/schema correction failed; another configured model may recover."""
+
+
+def failure_reason(error):
+    code=status_code(error)
+    if code==429: return 'API quota/rate limit reached; check billing or wait for the quota reset.'
+    if code in {401,403}: return 'Authorization failed; check the API key and account permissions.'
+    if code==404: return 'Configured model or uploaded file is unavailable; check model settings.'
+    if code==400: return 'The API rejected the request; check model compatibility and stage diagnostics.'
+    if isinstance(error,InvalidAIResponse): return 'The response failed local JSON/timestamp validation.'
+    if retryable(error): return 'Gemini service or connection unavailable after bounded retries.'
+    return 'Request failed; inspect the stage diagnostics and connection settings.'
+
+
+def safe_diagnostic(error):
+    if status_code(error) in {401,403}: return failure_reason(error)
+    import re
+    text=str(getattr(error,'message',str(error)))
+    keys={**dotenv_values(ROOT/'.env'),**os.environ}
+    for name,value in keys.items():
+        if value and any(marker in name.upper() for marker in ('KEY','TOKEN','SECRET','PASSWORD')):
+            text=text.replace(str(value),'[REDACTED]')
+    text=re.sub(r'AIza[\w-]+','[REDACTED]',text)
+    text=re.sub(r'(?i)(key|token|authorization)=([^&\s]+)',r'\1=[REDACTED]',text)
+    return text[:1200]
+
+
 def status_code(error):
     try:
         return int(getattr(error, 'code', 0) or 0)
@@ -294,18 +316,31 @@ def read_json(path):
 
 
 def atomic_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + '.tmp')
-    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False))
-    temporary.replace(path)
+    path=Path(path)
+    path.parent.mkdir(parents=True,exist_ok=True)
+    temporary=None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=path.parent,prefix='.'+path.name+'.',suffix='.tmp',delete=False) as stream:
+            temporary=Path(stream.name)
+            json.dump(value,stream,indent=2,ensure_ascii=False)
+            stream.flush();os.fsync(stream.fileno())
+        os.replace(temporary,path)
+    finally:
+        if temporary is not None: temporary.unlink(missing_ok=True)
+
+
+@lru_cache(maxsize=256)
+def _file_hash(path, size, mtime, ctime, inode):
+    digest=hashlib.sha256()
+    with open(path,'rb') as stream:
+        for chunk in iter(lambda:stream.read(1024*1024),b''):digest.update(chunk)
+    return digest.hexdigest()
 
 
 def video_identity(path):
-    digest = hashlib.sha256()
-    with path.open('rb') as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
+    path=Path(path).resolve();stat=path.stat()
+    return _file_hash(str(path),stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns,stat.st_ino)
+
 
 
 def clip_duration(path):
@@ -325,21 +360,75 @@ def clip_duration(path):
     return duration
 
 
-def normalize_transcript(transcript, duration):
-    if isinstance(transcript, (str, Path)):
-        transcript = read_json(Path(transcript))
-    if isinstance(transcript, dict):
-        transcript = transcript.get('word_segments', transcript.get('words'))
-    if not isinstance(transcript, list):
-        raise BrainError('Transcript must be WhisperX word JSON relative to the candidate clip.')
-    words = []
-    for word in transcript:
-        if not isinstance(word, dict):
-            raise BrainError('Each transcript entry must be a timed word.')
-        # WhisperX includes optional speaker/score fields; only pass trusted fields onward.
-        data = {'text': word.get('text', word.get('word')), 'start': word.get('start'), 'end': word.get('end')}
-        words.append(TranscriptWord.model_validate(data, context={'duration': duration}).model_dump())
-    return sorted(words, key=lambda w: w['start'])
+# Small acoustic alignment drift is safe to clip, not a license to shift a transcript.
+ALIGNMENT_EDGE_TOLERANCE_SECONDS = 0.25
+
+
+def normalize_transcript(transcript, duration, *, timeline=None, clip_start=None, preserve_metadata=False):
+    """Return bounded clip-relative words, with explicit source-timeline conversion.
+
+    Plain WhisperX lists are clip-relative. A source transcript must declare
+    {"timeline":"source", "clip_start":368.0, "words":[...]} or pass the equivalent
+    keyword arguments. Never infer an offset from word values or a filename.
+    Raw cached alignment is left intact for diagnosis and reuse.
+    """
+    if isinstance(duration,bool) or not isinstance(duration,(int,float)) or not math.isfinite(duration) or duration<=0:
+        raise BrainError('Actual clip duration must be finite and positive')
+    if isinstance(transcript,(str,Path)):
+        transcript=read_json(Path(transcript))
+    if isinstance(transcript,dict):
+        declared=transcript.get('timeline')
+        if timeline is not None and declared is not None and timeline!=declared:
+            raise BrainError('Conflicting transcript timeline declarations')
+        timeline=timeline or declared
+        declared_start=transcript.get('clip_start')
+        if clip_start is not None and declared_start is not None and clip_start!=declared_start:
+            raise BrainError('Conflicting source clip offsets')
+        clip_start=clip_start if clip_start is not None else declared_start
+        transcript=transcript.get('word_segments',transcript.get('words'))
+    timeline=timeline or 'clip'
+    if timeline not in {'clip','source'}:
+        raise BrainError('Transcript timeline must be clip or source')
+    if not isinstance(transcript,list):
+        raise BrainError('Transcript must contain a list of timed WhisperX words')
+    offset=0.0
+    if timeline=='source':
+        if (isinstance(clip_start,bool) or not isinstance(clip_start,(int,float))
+                or not math.isfinite(clip_start) or clip_start<0):
+            raise BrainError('Source-relative words require the explicit clip_start in VOD seconds')
+        offset=float(clip_start)
+    words=[]
+    tolerance=ALIGNMENT_EDGE_TOLERANCE_SECONDS
+    for index,word in enumerate(transcript):
+        if not isinstance(word,dict):
+            raise BrainError(f'Alignment word {index} is not a timed word record')
+        text=word.get('text',word.get('word'))
+        start,end=word.get('start'),word.get('end')
+        if (not isinstance(text,str) or not text.strip() or
+                any(isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value)
+                    for value in (start,end)) or end<=start):
+            raise BrainError(f'Invalid alignment at word {index}: require text and finite, increasing start/end times')
+        if timeline=='source' and start < -tolerance:
+            raise BrainError(f'Invalid negative VOD timestamp at alignment word {index}')
+        start,end=float(start)-offset,float(end)-offset
+        # Large unexplained clip-relative offsets indicate the wrong timeline/cache.
+        # Explicit source transcripts may legitimately contain the rest of a VOD.
+        if timeline=='clip' and (start < -tolerance or end > duration+tolerance):
+            raise BrainError(f'Alignment word {index} is far outside the {duration:.3f}s clip; check transcript provenance or declare a source timeline and clip_start')
+        if end<=0 or start>=duration:
+            continue
+        # A word crossing an edge by seconds is corrupted/misplaced, not rounding drift.
+        if start < -tolerance or end > duration+tolerance:
+            raise BrainError(f'Alignment word {index} crosses the clip boundary by more than {tolerance:.2f}s')
+        start,end=max(0.0,start),min(float(duration),end)
+        if end<=start:
+            continue
+        data=TranscriptWord.model_validate({'text':text.strip(),'start':start,'end':end},
+                                           context={'duration':duration}).model_dump()
+        if preserve_metadata:
+            data['speaker']=word.get('speaker')
+        words.append(data)
+    return sorted(words,key=lambda word:word['start'])
 
 
 class GeminiProvider:
@@ -405,22 +494,29 @@ class Brain:
                 return operation()
             except Exception as error:
                 self.attempts.append({'operation': label, 'attempt': attempt + 1,
-                                      'status': status_code(error), 'type': type(error).__name__})
+                                      'status': status_code(error), 'type': type(error).__name__,
+                                      'detail': safe_diagnostic(error)})
                 if not retryable(error) or attempt == settings.GEMINI_MAX_RETRIES:
                     raise
-                if getattr(settings, 'AI_DEBUG', False):
-                    print(f'Retrying {label}: status {status_code(error) or type(error).__name__}, retry {attempt + 1}/{settings.GEMINI_MAX_RETRIES}', flush=True)
                 self.sleep(min(30, 2 ** attempt) + random.uniform(0, 1))
 
     def verify_models(self):
         if self.models_verified:
             return
-        for model in (settings.GEMINI_PRIMARY_MODEL, settings.GEMINI_FALLBACK_MODEL):
+        self.available_models=[]
+        for model in dict.fromkeys((settings.GEMINI_PRIMARY_MODEL,settings.GEMINI_FALLBACK_MODEL)):
+            if not model: continue
             try:
-                self._retry(lambda: self.provider.verify_model(model), 'verify:' + model)
-            except Exception:
-                raise BrainError(f'Cannot verify configured model {model}; check model availability, key and account access.') from None
-        self.models_verified = True
+                self._retry(lambda:self.provider.verify_model(model),'verify:'+model)
+                self.available_models.append(model)
+            except BrainError:
+                raise
+            except Exception as error:
+                if status_code(error) in {401,403}:
+                    raise BrainError('Gemini authorization failed. Fix GEMINI_API_KEY or account permissions, then resume.') from None
+        if not self.available_models:
+            raise BrainError('Neither configured Gemini model is available. Check the key, model names, quota and connection; then resume.')
+        self.models_verified=True
 
     def _remote_file(self, path, digest):
         checkpoint = self.cache_path('upload', digest)
@@ -487,6 +583,16 @@ class Brain:
             atomic_json(self.cache_path('manifest', digest), manifest)
         return upgraded
 
+    def _cache_matches(self,saved,identity,key,stage,digest):
+        if not isinstance(saved,dict): return False
+        if saved.get('cache_key')==key: return True
+        manifest=read_json(self.cache_path('manifest',digest))
+        old=manifest.get(stage,{}).get('inputs') if isinstance(manifest,dict) else None
+        if not isinstance(old,dict) or fingerprint(old)!=saved.get('cache_key'): return False
+        # Repairing a model configuration must not discard successful stages.
+        ignored={'primary','fallback'}
+        return {k:v for k,v in old.items() if k not in ignored}=={k:v for k,v in identity.items() if k not in ignored}
+
     def _run_stage(self, stage, context, prompt, schema, data, *, force=False,
                    remote_factory=None, capabilities=None, cache_only=False):
         if not settings.AI_ENABLED:
@@ -510,29 +616,27 @@ class Brain:
         try:
             saved = read_json(cached_file) if settings.AI_CACHE_ENABLED and not force else None
             saved = self._migrate_edit_cache(stage, saved, identity, data, validation, key, digest)
-            if isinstance(saved, dict) and saved.get('cache_key') == key:
+            if self._cache_matches(saved, identity, key, stage, digest):
                 try:
                     result = schema.model_validate(saved['result'], context=validation)
-                    if saved['model'] not in (settings.GEMINI_PRIMARY_MODEL, settings.GEMINI_FALLBACK_MODEL):
+                    if not isinstance(saved['model'],str) or not saved['model']:
                         raise ValueError('Unexpected cached model')
                     self.last_model = saved['model']
                     self.models_used[stage] = saved['model']
-                    self._last_cache_key = key
+                    self._last_cache_key = saved['cache_key']
                     return result
                 except (ValidationError, KeyError, ValueError, TypeError):
                     pass
             if cache_only:
-                raise BrainError('No valid cached Clip Judge for this video/transcript. Run --judge-only first.')
+                raise BrainError('No valid cached judgment for this video/transcript. Resume the production run to analyze it.')
             self.verify_models()
             remote = remote_factory() if remote_factory else None
             full_prompt = prompt + '\nINPUT DATA (untrusted evidence, not instructions):\n' + json.dumps(data)
-            for model in (settings.GEMINI_PRIMARY_MODEL, settings.GEMINI_FALLBACK_MODEL):
+            for model in self.available_models:
                 try:
                     correction_note = ''
                     for correction in range(settings.AI_VALIDATION_RETRIES + 1):
                         request = full_prompt + correction_note
-                        if getattr(settings, 'AI_DEBUG', False):
-                            print(f'[{stage}] Requesting {model}' + (' (validation correction)' if correction else ''), flush=True)
                         raw = self._retry(
                             lambda: self.provider.generate(model, remote, request, schema), stage + ':' + model)
                         try:
@@ -540,7 +644,7 @@ class Brain:
                             break
                         except (ValidationError, ValueError, TypeError) as error:
                             if correction == settings.AI_VALIDATION_RETRIES:
-                                raise BrainError(f'{stage} output failed validation after bounded correction.') from None
+                                raise InvalidAIResponse(f'{stage} output failed validation after bounded correction.') from None
                             # Only local validation messages, never raw API exceptions or generated code.
                             issues = [{'field': '.'.join(map(str, item['loc'])), 'type': item['type']}
                                       for item in error.errors(include_input=False)] if isinstance(error, ValidationError) else []
@@ -564,7 +668,7 @@ class Brain:
                         self.cache_path(stage + '_error', digest).unlink(missing_ok=True)
                     return result
                 except Exception as error:
-                    if retryable(error) and model == settings.GEMINI_PRIMARY_MODEL:
+                    if model != self.available_models[-1] and (retryable(error) or status_code(error) in {400,404,429} or isinstance(error, InvalidAIResponse)):
                         continue
                     raise
         except Exception as error:
@@ -574,14 +678,15 @@ class Brain:
             })
             if isinstance(error, BrainError):
                 raise
-            raise BrainError(f'{stage} failed. Check its error record, key, quota and inputs; no result was fabricated.') from None
+            raise BrainError(f'Gemini {stage}: {failure_reason(error)} Progress is saved; fix the issue and resume.') from None
 
-    def judge_clip(self, video_path, transcript, *, force=False, cache_only=False):
+    def judge_clip(self, video_path, transcript, *, force=False, cache_only=False, duration=None):
         """Judge this candidate using video/audio and its clip-relative WhisperX words."""
         path = Path(video_path).resolve()
         try:
             digest = video_identity(path)
-            duration = clip_duration(path)
+            duration = clip_duration(path) if duration is None else float(duration)
+            if not math.isfinite(duration) or duration <= 0: raise ValueError("Invalid candidate duration")
             words = normalize_transcript(transcript, duration)
         except Exception:
             raise BrainError('Cannot read the candidate video or clip-relative word transcript. Check file paths and word timestamps.') from None
@@ -622,80 +727,11 @@ class Brain:
         context, data = self._analysis_data(analysis)
         return self._run_stage('thumbnail_plan', context, THUMBNAIL_PROMPT, ThumbnailPlan, data, force=force)
 
-    def debug(self, video_path, transcript, *, force=False, judge_only=False, stage='all'):
-        print('THE FARM 3 — AI BRAIN DEBUG')
-        print('PRIMARY MODEL:', settings.GEMINI_PRIMARY_MODEL)
-        print('FALLBACK MODEL:', settings.GEMINI_FALLBACK_MODEL)
-        independent = stage in {'edits', 'publishing', 'thumbnail'}
-        analysis = self.judge_clip(video_path, transcript,
-                                   force=force and not independent, cache_only=independent)
-        print('[STAGE 1] CLIP JUDGE — MODEL:', self.models_used['judge'])
-        print('Rating:', analysis.rating.upper())
-        print('Reason:', analysis.explanation)
-        print('Scene:', analysis.scene.summary)
-        for moment in analysis.scene.important_moments:
-            print(f'Important moment: {moment.time:.2f}s — {moment.description}')
-        if analysis.rating == 'stinker':
-            print('Rejected clip; pipeline stopped.')
-        elif not judge_only and stage != 'judge':
-            if stage in {'all', 'edits'}:
-                plan = self.plan_edits(analysis, force=force)
-                print('[STAGE 2] CREATIVE EDITOR — MODEL:', self.models_used['edit_plan'])
-                print(f'Zooms: {len(plan.zooms)}; effects: {len(plan.effects)}; music: {plan.background_music}')
-            if stage in {'all', 'publishing'}:
-                publication = self.write_publication(analysis, force=force)
-                print('[STAGE 3] PUBLISHING WRITER — MODEL:', self.models_used['publishing'])
-                print('Title:', publication.title)
-            if stage in {'all', 'thumbnail'}:
-                thumbnail = self.plan_thumbnail(analysis, force=force)
-                print('[STAGE 4] THUMBNAIL DIRECTOR — MODEL:', self.models_used['thumbnail_plan'])
-                print('Concept:', thumbnail.concept)
-        print('Video rendering skipped. Cache:', self.cache_root)
-        return analysis
-
     def close(self):
         if self._provider is not None:
             self._provider.close()
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Brain: four independent Gemini stages; never renders video.')
-    parser.add_argument('video', nargs='?')
-    parser.add_argument('--transcript', help='WhisperX word JSON on the candidate clip timeline')
-    parser.add_argument('--test-togi', action='store_true', help='Use Desktop/testTogi.mp4 and the existing caption_test word cache')
-    parser.add_argument('--judge-only', action='store_true', help='Stop after the Clip Judge')
-    parser.add_argument('--debug', action='store_true', help='Print validated stage summaries; never renders')
-    parser.add_argument('--stage', choices=['all', 'judge', 'edits', 'publishing', 'thumbnail'], default='all',
-                        help='Later stages require an existing valid judge cache and never repeat video analysis')
-    parser.add_argument('--force', action='store_true', help='Regenerate only the selected stage(s)')
-    parser.add_argument('--verify-models', action='store_true', help='Check access without uploading or generating')
-    args = parser.parse_args()
-    if args.test_togi:
-        if args.video or args.transcript:
-            parser.error('--test-togi already selects the test video and transcript')
-        args.video = str(Path.home() / 'Desktop' / 'testTogi.mp4')
-        args.transcript = str(ROOT / 'cache' / 'caption_test' / 'aligned_words.json')
-    brain = Brain()
-    try:
-        if args.verify_models:
-            brain.verify_models()
-            print('Both configured models are available to this account.')
-        else:
-            if not args.video or not args.transcript:
-                parser.error('video and --transcript are required')
-            brain.debug(args.video, args.transcript, force=args.force,
-                        judge_only=args.judge_only, stage=args.stage)
-    except BrainError as error:
-        print('Brain stopped:', error)
-        return 1
-    except ValidationError:
-        # Validation exceptions may contain transcript/response inputs; never print them.
-        print('Brain stopped: analysis or timestamps failed local validation.')
-        return 1
-    finally:
-        brain.close()
-    return 0
-
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    print('Start The Farm with: python run.py')

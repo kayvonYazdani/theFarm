@@ -151,10 +151,6 @@ def _generate_thumbnail(plan, workflow_path, server, folder, output, timeout=900
     )
 
 
-def engine():
-    return RenderEngine()
-
-
 def generate_thumbnail(plan, folder):
     """Create/resume the original ComfyUI thumbnail, preserving its workflow settings."""
     folder = Path(folder)

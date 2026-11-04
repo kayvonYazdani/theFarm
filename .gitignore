@@ -1,49 +1,82 @@
-# Credentials and local settings
+# Private configuration and credentials (including shared parent resources)
 .env
 .env.*
 !.env.example
+tokens/
+credentials/
 client_secret*.json
 *credentials*.json
+oauth*.json
+service_account*.json
+secrets*.json
 *token*.json
 *.pem
 *.key
-tokens/
+*.p12
+*.pfx
+.netrc
 
-# Python environments and caches
+# Python runtimes, bytecode and tooling
 .venv*/
 venv/
+env/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.DS_Store
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
 
-# Generated media, diagnostics, and local data
+# Managed inputs, outputs, caches and checkpoints; never delete local originals
+media/
 vids/
 clips/
 finished/
 cache/
 database/
+data/
 editF_output/
+.runtime/
 *.log
+*.lock
+*.tmp
+*.partial.*
+*.cache.json
+production.json
+production_run.json
+youtube_upload.json
+youtube_schedule.json
+thumbnail_status.json
 
-# Local media assets and old copies
+# Private media, model weights and external installations
+editingMedia/
 assets/
 clipSongs/
 clipEffect/
 clipIntro/
+VideoHighlighter/
+ComfyUI/
+models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
 [vV]ault/
 \[vault\]/
 
-.runtime/
-theFarm 3/VideoHighlighter/
-
-#csv's
-.csv
-
-#random codex ?
-
-.env
-.venv-brain/
-__pycache__/
-cache/ai_*.json
-
+# Editor / operating system files
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

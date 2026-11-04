@@ -89,7 +89,10 @@ def get_video_candidates():
 def download_video(platform, video):
     """Download a video at or below the configured resolution."""
 
-    video_id = video["id"]
+    import re
+    video_id = str(video["id"])
+    if not re.fullmatch(r"[A-Za-z0-9_-]+",video_id):
+        raise ValueError("Invalid source video identifier")
 
     # Create videos folder if missing
     settings.VIDS_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -107,7 +110,14 @@ def download_video(platform, video):
 
     if existing_files:
         print(f"Already downloaded: {video_id}")
-        return existing_files[0]
+        from editor import VideoEditor
+        for existing in existing_files:
+            try:
+                VideoEditor(existing)
+                return existing
+            except Exception:
+                # Preserve damaged data for inspection; yt-dlp must not silently reuse it.
+                raise ValueError(f"Existing download is invalid: {existing.name}; move it aside before retrying")
 
     # Set maximum download resolution
     height = int(settings.DOWNLOAD_HEIGHT)
@@ -118,7 +128,7 @@ def download_video(platform, video):
 
     command = [
         "yt-dlp",
-        "--no-playlist",
+        "--no-playlist", "--no-progress",
         "--no-overwrites",
 
         # Best available quality up to the configured height
@@ -139,11 +149,12 @@ def download_video(platform, video):
     result = subprocess.run(
         command,
         capture_output=True,
-        text=True
+        text=True, timeout=settings.DOWNLOAD_TIMEOUT
     )
 
     if result.returncode != 0:
         print(f"Download failed: {video_id}")
+        # Details are captured by the production session log, not shown on the dashboard.
         print(result.stderr)
         return None
 
@@ -171,60 +182,5 @@ def download_video(platform, video):
 #                    DOWNLOAD MANAGER
 # ============================================================
 
-def download_top_videos():
-    """Download the highest-ranked unprocessed videos and return their paths."""
-
-    platform, videos = get_video_candidates()
-
-    processed_ids = get_processed_ids(platform)
-
-    max_videos = int(settings.VIDEOS_TO_PROCESS)
-
-    downloaded_paths = []
-    selected_ids = set()
-
-    if max_videos <= 0:
-        return downloaded_paths
-
-    for video in videos:
-
-        # Stop when the requested number is reached
-        if len(downloaded_paths) >= max_videos:
-            break
-
-        video_id = str(video["id"])
-
-        # Skip videos that have already been posted
-        if video_id in processed_ids:
-            print(f"Skipping processed video: {video_id}")
-            continue
-
-        # Prevent duplicates within this run
-        if video_id in selected_ids:
-            continue
-
-        selected_ids.add(video_id)
-
-        # Download or reuse existing local copy
-        file_path = download_video(platform, video)
-
-        if file_path:
-            downloaded_paths.append(file_path)
-
-    print(
-        f"\nReady for clipping: "
-        f"{len(downloaded_paths)}/{max_videos} videos"
-    )
-
-    return downloaded_paths
-
-
-# ============================================================
-#                    MAIN
-# ============================================================
-
 if __name__ == "__main__":
-    downloaded_paths = download_top_videos()
-
-    for path in downloaded_paths:
-        print(f"Clipper input: {path}")
+    print("Start The Farm with: python run.py")

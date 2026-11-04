@@ -1,6 +1,5 @@
 import os
 import html
-from datetime import datetime, timezone
 import requests
 import re
 import config as settings
@@ -11,13 +10,18 @@ from dotenv import load_dotenv
 from googleapiclient.discovery import build
 
 
-load_dotenv()
+load_dotenv(settings.PROJECT_DIR / ".env")
+load_dotenv(settings.PROJECT_DIR.parent / ".env")
 
 CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
 
 API_KEY = os.getenv("YOUTUBE_API_KEY")
-youtube = build("youtube", "v3", developerKey=API_KEY)
+def youtube_service():
+    if not API_KEY:
+        raise ValueError("Set YOUTUBE_API_KEY in .env for YouTube discovery")
+    import httplib2
+    return build("youtube","v3",developerKey=API_KEY,http=httplib2.Http(timeout=30),cache_discovery=False)
 
 
 PICK_YT = settings.PICK_YT
@@ -39,6 +43,7 @@ def get_youtube_channel():
 def search_videos():
     """Find completed YouTube streams within the configured date and duration limits."""
 
+    youtube = youtube_service()
     # Select YouTube streamer
     channel_name, channel_id = get_youtube_channel()
     print(f"Searching YouTube streams from: {channel_name}")
@@ -131,6 +136,8 @@ def print_videos(videos):
 def search_vods():
     """Find Twitch VODs within the configured date and duration limits, ranked by views."""
 
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise ValueError("Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in .env for Twitch discovery")
     # Select Twitch streamer
     if settings.PICK_TWITCH.upper() == "RANDOM":
         name = random.choice(list(settings.TWITCH_CHANNELS))
@@ -265,14 +272,4 @@ def print_vods(videos):
 
 
 if __name__ == "__main__":
-
-    if settings.PLATFORM == "YT":
-        videos = search_videos()
-        print_videos(videos)
-
-    if settings.PLATFORM == "TTV":
-        videos = search_vods()
-        print_vods(videos)
-
-
-
+    print("Start The Farm with: python run.py")

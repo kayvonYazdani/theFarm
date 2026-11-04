@@ -1,17 +1,11 @@
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
 from pathlib import Path
-
 
 
 # ============================================================
 # FOLDER PATHS
 # ============================================================
-
-
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -24,9 +18,7 @@ CLIPS_FOLDER = MEDIA_FOLDER / "clips"
 DATABASE_FOLDER = PROJECT_DIR / "data"
 CACHE_FOLDER = PROJECT_DIR / "cache"
 YT_HISTORY = DATABASE_FOLDER / "YT_history.csv"
-TTV_HISTORY = DATABASE_FOLDER / "TTV_histroy.csv"
-
-
+TTV_HISTORY = DATABASE_FOLDER / "TTV_history.csv"
 
 
 # ============================================================
@@ -34,13 +26,10 @@ TTV_HISTORY = DATABASE_FOLDER / "TTV_histroy.csv"
 # ============================================================
 
 
-
-
-
 #. "YT" for YouTube "TTV" for Twitch .#
-PLATFORM = "TTV"
+PLATFORM = "YT"
 
-EVENT_TYPE = "completed"  # "completed" or "video"
+EVENT_TYPE = "video"  # "completed" or "video"
 
 DAYS_BACK = 14 # For both YT AND TTV whats the maximum age a video can be
 VIDEO_MAX_DURATION = 180  # Maximum Video duration in minutes for both
@@ -48,9 +37,8 @@ VIDEO_MAX_DURATION = 180  # Maximum Video duration in minutes for both
 DOWNLOAD_HEIGHT = 1080
 VIDEOS_TO_PROCESS = 1
 
-PICK_YT = "RANDOM" #Pick YouTuber (all caps) or select RANDOM
+PICK_YT = "TOGI" #Pick YouTuber (all caps) or select RANDOM
 PICK_TWITCH = "RANDOM" #Pick streamer (all caps) or select RANDOM
-
 
 
 EDITOR_FPS = 30
@@ -76,10 +64,8 @@ EDITOR_WHISPERX_PYTHON = (
 
 EDITOR_FONT = "/System/Library/Fonts/Avenir Next.ttc"
 EDITOR_CAPTION_SIZE = 50
-EDITOR_CAPTION_Y = 0.78
 
 EDITOR_CAPTION_MAX_CHARS = 28
-EDITOR_CAPTION_MAX_WORDS = 6
 EDITOR_CAPTION_PAUSE = 0.40
 EDITOR_CAPTION_MAX_WIDTH = 0.85
 
@@ -141,7 +127,6 @@ EDITOR_EMOJI_WORDS = {
 
 # AI BRAIN — optional creative planning; never starts video rendering.
 AI_ENABLED = True
-AI_DEBUG = False
 GEMINI_PRIMARY_MODEL = "gemini-3.8-flash"
 GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 GEMINI_MAX_RETRIES = 3  # Additional attempts per model for transient errors.
@@ -150,9 +135,9 @@ AI_VALIDATION_RETRIES = 1
 AI_CACHE_ENABLED = True
 
 # PRODUCTION — run with: python run.py
-INPUT_VIDEO = Path.home() / "Desktop" / "testTogi.mp4"
-INPUT_TRANSCRIPT = CACHE_FOLDER / "caption_test" / "aligned_words.json"
-USE_CLIPPER = False
+INPUT_VIDEO = None  # Optional local file; otherwise SOURCE_MODE selects sources.
+INPUT_TRANSCRIPT = None  # Optional word-timed JSON for INPUT_VIDEO only.
+USE_CLIPPER = True
 OUTPUT_DIR = PROJECT_DIR / "finished"
 MANUAL_TITLE = ""  # Optional when AI_ENABLED is False; otherwise use the source filename.
 MANUAL_DESCRIPTION = ""
@@ -181,21 +166,20 @@ TITLE_TEXT_RIGHT = 40
 TITLE_TEXT_Y = 60
 TITLE_TEXT_COLOR = "#ADD8E6"
 
-# Reuse the installed VideoHighlighter and Farm 2.2's existing isolated worker/selector.
-LEGACY_FARM_DIR = PROJECT_DIR.parent / "[vault]" / "theFarm2.2"
+# VideoHighlighter: quality-gated peaks, never a count or duration quota.
 VIDEOHIGHLIGHTER_DIR = PROJECT_DIR / "VideoHighlighter"
 VIDEOHIGHLIGHTER_PYTHON = VIDEOHIGHLIGHTER_DIR / ".venv-videohighlighter" / "bin" / "python"
 VIDEOHIGHLIGHTER_TIMEOUT = 7200
 VIDEOHIGHLIGHTER_MAX_CANDIDATES = 10
-MAX_CLIP_DURATION = 180
+MAX_CLIP_DURATION = 60
 VIDEOHIGHLIGHTER_MIN_SCORE = 3.0
 VIDEOHIGHLIGHTER_MIN_PROMINENCE = 2.0
 VIDEOHIGHLIGHTER_OPTIONS = {
-    "clip_time": 0, "auto_min_clip": 0.0, "auto_max_clip": 180,
+    "clip_time": 0, "auto_min_clip": 0.0,
     "scene_points": 1, "motion_event_points": 1,
     "motion_peak_points": 3, "audio_peak_points": 3,
     "object_points": 0, "action_points": 0, "keyword_points": 0,
-    "highlight_objects": [], "interesting_actions": [],
+    "highlight_objects": [], "interesting_actions": [], "search_keywords": [],
     "use_transcript": False, "write_highlight_report": False,
 }
 
@@ -208,9 +192,37 @@ THUMBNAIL_WIDTH = 720
 THUMBNAIL_HEIGHT = 1280
 THUMBNAIL_TIMEOUT = 900
 
-# Uploading is manual only: post_to_youtube.py --upload. run.py never uploads.
+# YouTube account settings. Optional run.py delivery is controlled below.
 YOUTUBE_CLIENT_FILE = ""  # Auto-find a single client_secret*.json in tokens.
 YOUTUBE_TOKEN_FILE = TOKEN_RESOURCE_DIR / "youtube_token.json"
 YOUTUBE_CATEGORY_ID = "24"
 YOUTUBE_MADE_FOR_KIDS = False
 YOUTUBE_PRIVACY = "private"
+
+# Universal opening riser: mixed once at 0 seconds in the existing effects/audio pass.
+EDITOR_INTRO_SOUND = PROJECT_DIR / "editingMedia" / "clipIntro" / "quickRiser.MP3"
+EDITOR_INTRO_VOLUME = 0.65
+
+# SOURCE_MODE: "folder" scans media/videos; "discover" uses the existing finder/downloader.
+SOURCE_MODE = "discover"
+HIGHLIGHT_CONTEXT_BEFORE = 12.0
+HIGHLIGHT_CONTEXT_AFTER = 18.0
+FFMPEG_THREADS = 4
+WHISPER_CPU_THREADS = 4
+DOWNLOAD_TIMEOUT = 7200
+INTERACTIVE_RETRY = True
+TEMP_RETENTION_HOURS = 48
+CHECKPOINT_FILE = DATABASE_FOLDER / "production_run.json"
+LOG_FILE = DATABASE_FOLDER / "farm.log"
+
+# Optional YouTube delivery from run.py (disabled until you enable it).
+UPLOAD_ENABLED = True
+UPLOAD_MODE = "scheduled"  # "scheduled" or "immediate"
+UPLOAD_TIMEZONE = "America/New_York"
+UPLOAD_TIMES = ("12:00", "17:00")  # Noon, then 5 PM, repeating daily from tomorrow.
+UPLOAD_VIDEOS_PER_SLOT = 1  # Or {"12:00": 2, "17:00": 1} for different batch sizes.
+UPLOAD_IMMEDIATE_PRIVACY = "public"  # "public", "unlisted", or "private"
+UPLOAD_SCHEDULE_FILE = DATABASE_FOLDER / "youtube_schedule.json"
+
+# Delete managed inputs/intermediates only after every stage and enabled upload succeeds.
+CLEANUP_AFTER_SUCCESS = True

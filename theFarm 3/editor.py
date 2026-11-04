@@ -7,6 +7,7 @@ import sys
 import math
 import random
 import subprocess
+import tempfile
 from pathlib import Path
 
 import config as settings
@@ -154,45 +155,58 @@ class EffectsEditor:
         threshold = float(getattr(settings, "EDITOR_SHAKE_THRESHOLD_DB", self.SHAKE_THRESHOLD_DB))
         if not math.isfinite(threshold) or threshold > 0:
             raise ValueError("Shake threshold must be finite and <= 0 dBFS")
-        # Analyze the clip before flash sound effects are mixed into it.
-        result = subprocess.run([
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", str(input_video), "-vn", "-ac", "2", "-ar", "48000",
-            "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1",
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        samples = array.array("f")
-        samples.frombytes(result.stdout)
-        if sys.byteorder != "little":
-            samples.byteswap()
-        window = 960  # 20 ms at 48 kHz; visual changes occur on video frames.
-        limit = 10 ** (threshold / 20)
+        # Stream 20 ms PCM windows; never hold the full decoded track in memory.
         events = []
         start = None
-        frames = len(samples) // 2
-        for offset in range(0, frames, window):
-            end = min(offset + window, frames)
-            # Either channel can trigger shake, without stereo phase cancellation.
-            rms = max(
-                math.sqrt(sum(value * value for value in
-                              samples[2 * offset + channel:2 * end:2]) / (end - offset))
-                for channel in (0, 1)
-            )
-            if rms >= limit and start is None:
-                start = offset / 48000
-            elif rms < limit and start is not None:
-                events.append((start, offset / 48000 - start))
-                start = None
-        if start is not None:
-            events.append((start, frames / 48000 - start))
+        offset = 0
+        limit = 10 ** (threshold / 20)
+        with tempfile.TemporaryFile() as errors:
+            process = subprocess.Popen([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(input_video),
+                "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1",
+            ], stdout=subprocess.PIPE, stderr=errors)
+            try:
+                while True:
+                    chunk = process.stdout.read(960 * 2 * 4)
+                    if not chunk:
+                        break
+                    while len(chunk) < 960 * 2 * 4:
+                        more = process.stdout.read(960 * 2 * 4 - len(chunk))
+                        if not more: break
+                        chunk += more
+                    samples = array.array("f")
+                    samples.frombytes(chunk[:len(chunk) // 8 * 8])
+                    if sys.byteorder != "little": samples.byteswap()
+                    frames = len(samples) // 2
+                    if not frames: break
+                    rms = max(math.sqrt(sum(v*v for v in samples[channel::2]) / frames) for channel in (0,1))
+                    if rms >= limit and start is None:
+                        start = offset / 48000
+                    elif rms < limit and start is not None:
+                        events.append((start,offset / 48000-start));start=None
+                    offset += frames
+                if process.wait():
+                    raise RuntimeError("Audio-volume analysis failed; check the source audio stream")
+            except BaseException:
+                process.kill();process.wait();raise
+            finally:
+                process.stdout.close()
+        if start is not None: events.append((start,offset / 48000-start))
         return events
 
     def render(self, input_video, output_video):
         """Apply flashes and shakes after captions; let every effect sound finish."""
         input_video = Path(input_video)
         output_video = Path(output_video)
-        shake_events = self._audio_shake_events(input_video) if self.shake_enabled else []
-        if not self.flash_times and not self.vine_boom_events and not shake_events and self.music is None:
-            return input_video
+        # Universal opening sound: never selected or controlled by the AI plan.
+        intro_path = Path(settings.EDITOR_INTRO_SOUND)
+        intro_volume = float(settings.EDITOR_INTRO_VOLUME)
+        if not intro_path.is_file():
+            raise FileNotFoundError(f"Opening riser sound not found: {intro_path}")
+        if not math.isfinite(intro_volume) or intro_volume < 0:
+            raise ValueError("EDITOR_INTRO_VOLUME must be finite and nonnegative")
+        source_info = VideoEditor(input_video).info
+        shake_events = self._audio_shake_events(input_video) if self.shake_enabled and source_info["has_audio"] else []
         if input_video.resolve() == output_video.resolve():
             raise ValueError("Effect input and output must be different files")
         if self.flash_times and not self.sound_path.is_file():
@@ -239,13 +253,14 @@ class EffectsEditor:
         # Extend the final frame only if a delayed sound outlasts the input video.
         # amix ends after the longest input, so the MP3 is never trimmed by the flash.
         graph.append(f"{video_label}tpad=stop_mode=clone:stop=-1,format=yuv420p[v]")
-        graph.append(
-            "[0:a]aresample=48000,aformat=sample_fmts=fltp:"
-            "channel_layouts=stereo[dialogue]"
-        )
+        if source_info["has_audio"]:
+            graph.append("[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[dialogue]")
+        else:
+            graph.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={source_info['duration']}[dialogue]")
         inputs = ["-i", str(input_video)]
         audio_labels = ["[dialogue]"]
-        sounds = [(time, self.sound_path, self.FLASH_VOLUME) for time in self.flash_times]
+        sounds = [(0.0, intro_path, intro_volume)]
+        sounds += [(time, self.sound_path, self.FLASH_VOLUME) for time in self.flash_times]
         sounds += [(event["time"], event["path"], self.VINE_BOOM_VOLUME)
                    for event in self.vine_boom_events]
         for index, (time, sound_path, volume) in enumerate(sounds, start=1):
@@ -298,7 +313,7 @@ class EffectsEditor:
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             *inputs, "-filter_complex", ";".join(graph),
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-threads", str(settings.FFMPEG_THREADS),
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", "-shortest", str(output_video),
         ], check=True)
@@ -400,6 +415,7 @@ class FilterEditor:
 
 
 class VideoEditor:
+    _probe_cache = {}
     def __init__(self, video_path):
         """Load video information and editing components."""
         self.video_path = Path(video_path)
@@ -413,16 +429,27 @@ class VideoEditor:
 
     def get_video_info(self):
         """Read video size, frame rate, and duration with FFprobe."""
+        stat = self.video_path.stat()
+        key = (str(self.video_path.resolve()),stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns,stat.st_ino)
+        if key in self._probe_cache:
+            return dict(self._probe_cache[key])
         result = subprocess.run([
             "ffprobe", "-v", "error", "-show_entries",
-            "format=duration:stream=codec_type,width,height,r_frame_rate",
+            "format=duration:stream=codec_type,width,height,r_frame_rate,duration",
             "-of", "json", str(self.video_path)
-        ], capture_output=True, text=True, check=True)
+        ], capture_output=True, text=True, check=True, timeout=30)
         data = json.loads(result.stdout)
         stream = next(s for s in data["streams"] if s["codec_type"] == "video")
         numerator, denominator = map(int, stream["r_frame_rate"].split("/"))
-        return {"width": stream["width"], "height": stream["height"],
-                "fps": numerator / denominator, "duration": float(data["format"]["duration"])}
+        info = {"width": stream["width"], "height": stream["height"],
+                "fps": numerator / denominator,
+                "duration": float(stream["duration"] if stream.get("duration") not in (None,"N/A") else data["format"]["duration"]),
+                "has_audio": any(s["codec_type"]=="audio" for s in data["streams"])}
+        if not math.isfinite(info["duration"]) or info["duration"] <= 0 or denominator == 0:
+            raise ValueError("Invalid video timing")
+        if len(self._probe_cache) >= 64: self._probe_cache.clear()
+        self._probe_cache[key] = dict(info)
+        return info
 
     def render(self, output_path):
         """Export the zoomed, vertically formatted and color-corrected video."""
@@ -432,7 +459,7 @@ class VideoEditor:
         subprocess.run([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(self.video_path),
             "-filter_complex", graph, "-map", "[final]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-threads", str(settings.FFMPEG_THREADS),
             "-r", str(settings.EDITOR_FPS), "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", "-shortest", str(output_path)
         ], check=True)
@@ -440,6 +467,7 @@ class VideoEditor:
 
 
 class CaptionEditor:
+    _models = {}
     def __init__(self):
         """Configure transcription, alignment, and one-line karaoke captions."""
         self.model_name = settings.EDITOR_WHISPER_MODEL
@@ -471,20 +499,56 @@ class CaptionEditor:
     def transcribe(self, video_path):
         """Transcribe spoken sentences with Faster-Whisper."""
         from faster_whisper import WhisperModel
-        model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
+        if self.model_name not in self._models:
+            self._models[self.model_name] = WhisperModel(self.model_name, device="cpu", compute_type="int8",
+                                                       cpu_threads=settings.WHISPER_CPU_THREADS, num_workers=1)
+        model = self._models[self.model_name]
         segments, _ = model.transcribe(str(video_path), language=self.language,
                                        vad_filter=True, beam_size=5,
                                        condition_on_previous_text=False)
         return [{"start": float(s.start), "end": float(s.end), "text": s.text.strip()}
                 for s in segments if s.text.strip()]
 
-    def align_words(self, video_path, segments, cache, prefix=""):
+    @staticmethod
+    def _bounded_segments(segments, duration):
+        """Remove Whisper's final 30-second window padding before forced alignment.
+
+        WhisperX scales word positions using the declared sentence duration,
+        even when its audio slice is shorter. Never pass padded intervals to it.
+        """
+        from brain import BrainError
+        if not isinstance(segments, list):
+            raise BrainError("Transcript segments must be a list")
+        bounded = []
+        padded_end = math.ceil(duration / 30.0) * 30.0 + 0.25
+        for index, segment in enumerate(segments):
+            if not isinstance(segment, dict):
+                raise BrainError(f"Invalid transcript segment {index}")
+            start, end, text = (segment.get(k) for k in ('start', 'end', 'text'))
+            if (not isinstance(text, str) or not text.strip() or
+                    any(isinstance(x, bool) or not isinstance(x, (int, float)) or
+                        not math.isfinite(x) for x in (start, end)) or
+                    start < 0 or end <= start or end > padded_end):
+                raise BrainError(f"Invalid clip-relative transcript segment {index}: {start}–{end}")
+            if start >= duration:
+                continue
+            bounded.append({**segment, 'end': min(end, duration)})
+        return bounded
+
+    def align_words(self, video_path, segments, cache, prefix="", duration=None):
         """Align spoken words using WhisperX installed in its separate Python venv."""
         if not self.whisperx_python.is_file():
             raise FileNotFoundError(f"WhisperX Python not found: {self.whisperx_python}")
         transcript_file = cache / f"{prefix}transcript.json"
+        # A caller-supplied shared prefix must never mix different clips.
+        from brain import BrainError, video_identity
+        if Path(video_path).is_file():
+            prefix = video_identity(video_path)[:24] + "_"
         aligned_file = cache / f"{prefix}aligned_words.json"
-        transcript_file.write_text(json.dumps(segments, indent=2), encoding="utf-8")
+        duration = VideoEditor(video_path).info["duration"] if duration is None else duration
+        segments = self._bounded_segments(segments, duration)
+        from brain import atomic_json
+        atomic_json(transcript_file, segments)
         worker = '''
 import json
 import sys
@@ -495,44 +559,69 @@ segments = json.loads(Path(transcript).read_text(encoding="utf-8"))
 audio = whisperx.load_audio(video)
 model, metadata = whisperx.load_align_model(language_code=language, device="cpu")
 result = whisperx.align(segments, model, metadata, audio, "cpu", return_char_alignments=False)
-Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding="utf-8")
+temporary = Path(output).with_suffix(".tmp")
+temporary.write_text(json.dumps(result["word_segments"], indent=2), encoding="utf-8")
+temporary.replace(output)
 '''
         subprocess.run([str(self.whisperx_python), "-c", worker, str(video_path),
-                        str(transcript_file), str(aligned_file), self.language], check=True)
-        return self._load_aligned(aligned_file)
+                        str(transcript_file), str(aligned_file), self.language], check=True,
+                       stdout=getattr(settings,"_LOG_STREAM",None),stderr=getattr(settings,"_LOG_STREAM",None))
+        return self._load_aligned(aligned_file, duration=duration if duration is not None else VideoEditor(video_path).info["duration"])
 
-    def _load_aligned(self, aligned_file):
-        """Normalize WhisperX's word entries for caption rendering."""
+    def _load_aligned(self, aligned_file, *, duration):
+        """Validate raw cached words before filtering, and bound the caption timeline."""
+        from brain import normalize_transcript
         raw = json.loads(Path(aligned_file).read_text(encoding="utf-8"))
-        self.words = [
-            {"text": str(w.get("text", w.get("word", ""))).strip(),
-             "start": float(w["start"]), "end": float(w["end"]),
-             "speaker": w.get("speaker")}
-            for w in raw
-            if str(w.get("text", w.get("word", ""))).strip()
-            and w.get("start") is not None and w.get("end") is not None
-            and float(w["end"]) > float(w["start"])
-        ]
+        self.words = normalize_transcript(raw,duration,preserve_metadata=True)
         return self.words
 
-    def prepare(self, video_path, cache, prefix=""):
+    def prepare(self, video_path, cache, prefix="", duration=None):
         """Reuse existing aligned-word JSON or generate it from the input video."""
         cache = Path(cache)
         cache.mkdir(parents=True, exist_ok=True)
+        # A caller-supplied shared prefix must never mix different clips.
+        from brain import BrainError, video_identity
+        if Path(video_path).is_file():
+            prefix = video_identity(video_path)[:24] + "_"
         aligned_file = cache / f"{prefix}aligned_words.json"
+        duration = VideoEditor(video_path).info["duration"] if duration is None else duration
         if aligned_file.is_file():
-            print("Loading cached WhisperX alignment...")
-            words = self._load_aligned(aligned_file)
-            print(f"Loaded {len(words)} aligned words.")
-            return words
+            try:
+                words = self._load_aligned(aligned_file, duration=duration)
+                print(f"Loaded {len(words)} aligned words from cache.")
+                return words
+            except BrainError:
+                # Repair only the diagnosed padded-sentence failure. Unexplained
+                # mismatches still pause, rather than concealing a wrong cache.
+                saved = cache / f"{prefix}transcript.json"
+                segments = json.loads(saved.read_text()) if saved.is_file() else None
+                bounded = self._bounded_segments(segments, duration)
+                if bounded == segments:
+                    raise
+                print("Rebuilding alignment with clip-bounded transcript segments.")
+                return self.align_words(video_path, bounded, cache, prefix, duration=duration)
+            except (ValueError,KeyError,TypeError):
+                print("Cached alignment is invalid; rebuilding from the saved transcript.")
         print("Faster-Whisper: Transcribing...")
-        segments = self.transcribe(video_path)
+        transcript_file = cache / f"{prefix}transcript.json"
+        try:
+            segments = json.loads(transcript_file.read_text()) if transcript_file.is_file() else None
+            if segments is not None and (not isinstance(segments,list) or any(not isinstance(x,dict) or not all(k in x for k in ('start','end','text')) for x in segments)):
+                segments = None
+        except (OSError,ValueError):
+            segments = None
+        if segments is None:
+            segments = self.transcribe(video_path)
+            from brain import atomic_json
+            atomic_json(transcript_file,segments)
+        segments = self._bounded_segments(segments, duration)
         if not segments:
             self.words = []
-            print("No dialogue detected.")
+            from brain import atomic_json
+            atomic_json(aligned_file,[])
             return []
         print("WhisperX: Aligning words...")
-        words = self.align_words(video_path, segments, cache, prefix)
+        words = self.align_words(video_path, segments, cache, prefix, duration=duration)
         print(f"Successfully aligned {len(words)} words.")
         return words
 
@@ -830,7 +919,7 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
             "-i", str(input_video),
             "-filter_complex", "[1:v][0:v]overlay=0:0:format=auto:shortest=1[v]",
             "-map", "[v]", "-map", "1:a?", "-c:v", "libx264",
-            "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-preset", "fast", "-crf", "20", "-threads", str(settings.FFMPEG_THREADS), "-pix_fmt", "yuv420p",
             "-c:a", "copy", "-movflags", "+faststart", str(output_video)
         ]
         print(f"Rendering {len(layouts)} fixed-position caption phrases and "
@@ -857,7 +946,7 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
             process.stdin.close()
             error = process.stderr.read().decode("utf-8", errors="replace")
             code = process.wait()
-        except Exception:
+        except BaseException:
             process.kill()
             process.wait()
             raise
@@ -865,31 +954,6 @@ Path(output).write_text(json.dumps(result["word_segments"], indent=2), encoding=
             raise RuntimeError(f"FFmpeg caption overlay failed: {error[-2000:]}")
         return output_video
 
-def main():
-    """Render the test video with captions and a flashbang at 15 seconds."""
-    desktop = Path.home() / "Desktop"
-    source = desktop / "testTogi.mp4"
-    cache = Path(__file__).resolve().parent / "cache" / "caption_test"
-
-    editor = VideoEditor(source)
-    editor.effects.flashbang(15.0)
-    # editor.effects.background_music("chill/upbeat")  # Or "sad" / "mystery".
-    editor.effects.vine_boom(8.0)  # Random clipEffect sound at 8 seconds.
-    editor.effects.shake()  # Shake only while the clip audio reaches the threshold.
-
-    cache.mkdir(parents=True, exist_ok=True)
-    base_video = editor.render(cache / "testTogi_edited.mp4")
-
-    captions = CaptionEditor()
-    captions.prepare(source, cache)
-    captioned_video = captions.render_captions(
-        base_video, cache / "testTogi_captioned_base.mp4", editor.info, cache
-    )
-    result = editor.effects.render(
-        captioned_video, desktop / "testTogi_captioned.mp4"
-    )
-    print(f"Finished: {result}")
-
 
 if __name__ == "__main__":
-    main()
+    print("Start The Farm with: python run.py")

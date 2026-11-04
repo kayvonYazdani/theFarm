@@ -70,9 +70,6 @@ class FakeProvider:
 
 class BrainTests(unittest.TestCase):
     def setUp(self):
-        self.debug_setting = patch.object(brain.settings, 'AI_DEBUG', False)
-        self.debug_setting.start()
-        self.addCleanup(self.debug_setting.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -116,10 +113,10 @@ class BrainTests(unittest.TestCase):
         data['rating'] = 'stinker'
         b, p = self.make([json.dumps(data)])
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            result = b.debug(self.video, self.transcript)
+            result = b.judge_clip(self.video, self.transcript)
         self.assertEqual(result.rating, 'stinker')
         self.assertEqual(len(p.calls), 1)
-        self.assertIn('pipeline stopped', out.getvalue())
+        with self.assertRaises(brain.BrainError): b.plan_edits(result)
     def test_invalid_json_corrected(self):
         b, p = self.make(['bad json', json.dumps(VALID)])
         b.judge_clip(self.video, self.transcript)
@@ -149,11 +146,14 @@ class BrainTests(unittest.TestCase):
         self.video.write_bytes(b'candidate2')
         b.judge_clip(self.video, self.transcript)
         self.assertEqual(p.uploads, 2)
-    def test_debug_no_render(self):
+    def test_ai_stages_never_render(self):
         b, p = self.make()
         with patch.object(brain.subprocess, 'run', side_effect=AssertionError('render attempted')):
             with contextlib.redirect_stdout(io.StringIO()):
-                b.debug(self.video, self.transcript)
+                analysis=b.judge_clip(self.video, self.transcript)
+                b.plan_edits(analysis)
+                b.write_publication(analysis)
+                b.plan_thumbnail(analysis)
     def test_secret_not_logged_and_auth_not_retried(self):
         secret = 'API_SECRET_SENTINEL'
         b, p = self.make([APIError(401, secret)])
@@ -167,10 +167,10 @@ class BrainTests(unittest.TestCase):
             with self.assertRaises(brain.BrainError):
                 brain.GeminiProvider()
     def test_quota_not_retried(self):
-        b, p = self.make([APIError(429, 'daily quota exhausted')])
+        b, p = self.make([APIError(429, 'daily quota exhausted')]*2)
         with self.assertRaises(brain.BrainError):
             b.judge_clip(self.video, self.transcript)
-        self.assertEqual(len(p.calls), 1)
+        self.assertEqual(len(p.calls), 2)
     def test_expired_upload_replaced(self):
         b, p = self.make([json.dumps(VALID)] * 2)
         b.judge_clip(self.video, self.transcript)
@@ -341,7 +341,8 @@ class BrainTests(unittest.TestCase):
         b, p = self.make([json.dumps(x) for x in (VALID, PUBLICATION, PUBLICATION)])
         b.judge_clip(self.video, self.transcript)
         with contextlib.redirect_stdout(io.StringIO()):
-            b.debug(self.video, self.transcript, stage='publishing', force=True)
+            analysis=b.judge_clip(self.video,self.transcript,cache_only=True)
+            b.write_publication(analysis,force=True)
         self.assertEqual(len(p.calls), 2)
         self.assertEqual(p.uploads, 1)
         self.assertFalse(b.cache_path('edit_plan').exists())
@@ -377,14 +378,45 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(config.response_json_schema, brain.ClipJudgment.model_json_schema())
         self.assertFalse(config.response_json_schema['additionalProperties'])
 
-    def test_test_togi_shortcut_uses_editor_test_inputs(self):
-        with patch.object(brain, 'Brain') as cls, patch.object(brain.sys if hasattr(brain, 'sys') else sys, 'argv', ['brain.py', '--test-togi', '--debug']):
-            self.assertEqual(brain.main(), 0)
-        args, kwargs = cls.return_value.debug.call_args
-        self.assertEqual(Path(args[0]), Path.home() / 'Desktop' / 'testTogi.mp4')
-        self.assertEqual(Path(args[1]), brain.ROOT / 'cache' / 'caption_test' / 'aligned_words.json')
-        self.assertFalse(kwargs['judge_only'])
-        self.assertEqual(kwargs['stage'], 'all')
+    def test_production_has_no_demo_entry_points(self):
+        self.assertFalse(hasattr(brain.Brain,'debug'))
+        self.assertFalse(hasattr(brain,'main'))
+        source=Path(brain.__file__).read_text()
+        self.assertNotIn('test-togi',source.lower())
+
+    def test_invalid_response_recovers_with_fallback(self):
+        b,p=self.make(['invalid','invalid',json.dumps(VALID)])
+        result=b.judge_clip(self.video,self.transcript)
+        self.assertEqual(result.rating,'postable')
+        self.assertEqual(b.last_model,brain.settings.GEMINI_FALLBACK_MODEL)
+
+    def test_quota_failure_tries_fallback_once(self):
+        b,p=self.make([APIError(429,'daily quota exhausted'),json.dumps(VALID)])
+        b.judge_clip(self.video,self.transcript)
+        self.assertEqual(len(p.calls),2)
+        self.assertEqual(b.last_model,brain.settings.GEMINI_FALLBACK_MODEL)
+
+    def test_unavailable_primary_uses_available_fallback(self):
+        b,p=self.make()
+        def verify(model):
+            if model==brain.settings.GEMINI_PRIMARY_MODEL: raise APIError(404)
+        p.verify_model=verify
+        b.judge_clip(self.video,self.transcript)
+        self.assertEqual(p.calls,[brain.settings.GEMINI_FALLBACK_MODEL])
+
+    def test_model_repair_keeps_successful_judge_cache(self):
+        b,p=self.make()
+        original=b.judge_clip(self.video,self.transcript)
+        with patch.object(brain.settings,'GEMINI_PRIMARY_MODEL','repaired-model'):
+            repaired=brain.Brain(self.root/'cache',FakeProvider([]),sleep=lambda _:None)
+            cached=repaired.judge_clip(self.video,self.transcript,cache_only=True)
+            self.assertEqual(original,cached)
+            self.assertEqual(original._clip_context['judge_cache_key'],cached._clip_context['judge_cache_key'])
+
+    def test_hash_cache_invalidates_when_source_changes(self):
+        before=brain.video_identity(self.video)
+        self.video.write_bytes(b'new candidate')
+        self.assertNotEqual(before,brain.video_identity(self.video))
 
 
 if __name__ == '__main__':
